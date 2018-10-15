@@ -55,7 +55,7 @@ struct SclrEvolution : public FunctionPass {
   void sortInstructions(BasicBlock *bb,
                         std::map<int, Instruction *> instOffsetMap) {
 
-    Instruction *lastGEP = instOffsetMap.rbegin()->second;
+    Instruction *lastInst = bb->getTerminator();
 
 	/// For any instruction GEP 'i', other than the last one, 
 	/// 1. move 'i' before the last GEP instructions.
@@ -64,9 +64,7 @@ struct SclrEvolution : public FunctionPass {
     for (std::map<int, Instruction *>::iterator itr = instOffsetMap.begin();
          itr != instOffsetMap.end(); itr++) {
 
-      if (itr->second != lastGEP) {
-
-        itr->second->moveBefore(lastGEP);
+        itr->second->moveBefore(lastInst);
         Instruction *prevInst = itr->second;
 
         for (User *U : itr->second->users()) {
@@ -75,7 +73,6 @@ struct SclrEvolution : public FunctionPass {
           useInst->moveAfter(prevInst);
           prevInst = useInst;
         }
-      }
     }
 
     return;
@@ -96,14 +93,30 @@ struct SclrEvolution : public FunctionPass {
 	/// Each function may contain multiple loops of such array accesses, hence iterating across
 	/// all of them.
     for (Loop *loop : LI) {
-
+			
+	  int flag = 0;	
+	  const SCEV *baseObj = NULL;
       BasicBlock *bb = getLoopBody(loop);
       bb->dump();
 	
 	  /// Make a list of all GEP instructions. This list is used to calculate the offset below.
       for (Instruction &i : *bb)
-        if (isa<GetElementPtrInst>(i))
-          accessInst.push_back(dyn_cast<GetElementPtrInst>(&i));
+        if (isa<GetElementPtrInst>(i)) {
+
+		  GetElementPtrInst *GEPInst = dyn_cast<GetElementPtrInst>(&i);
+		  
+		  if(baseObj)
+			if(SE.getPointerBase(SE.getSCEV(GEPInst)) != baseObj) {
+			  flag = 1;
+			  break;
+			}
+
+		  baseObj = SE.getPointerBase(SE.getSCEV(GEPInst));
+          accessInst.push_back(GEPInst);
+		}
+	
+	  if(flag)
+		continue;
 
       firstInstSCEV = SE.getSCEV(accessInst[0]);
 
@@ -126,8 +139,11 @@ struct SclrEvolution : public FunctionPass {
         if (isa<GetElementPtrInst>(i))
           errs() << *(SE.getSCEV(&i)) << "\n";
       bb->dump();
-    }
 
+	  accessInst.clear();
+	  instOffsetMap.clear();
+    }
+	
     return false;
   }
 
