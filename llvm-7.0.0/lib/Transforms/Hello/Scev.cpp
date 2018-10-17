@@ -1,3 +1,12 @@
+//===- Scev.cpp - Code from sorting GEP instructions, uses SCEV ------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
@@ -5,6 +14,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
@@ -32,15 +42,18 @@ struct SclrEvolution : public FunctionPass {
   /// \returns BasicBlock object of the loop body.
   BasicBlock *getLoopBody(Loop *loop) {
 	
-	BasicBlock *body;	
+	BasicBlock *body = NULL;
 	
 	/// Iterates across all the basic blocks of a loop and returns the one which 
 	/// is not the header or the latch, hence the body.
 	for (BasicBlock *block : loop->getBlocks()) {
-	  
-	  if((block != loop->getHeader()) && (block != loop->getLoopLatch()))
+	
+	  assert(loop->getHeader() && loop->getLoopLatch() && "Loop not in canonical form");
+	  if((block != loop->getHeader()) && (block != loop->getLoopLatch())) {
+
+		assert(!body && "Loop contains more than 1 basic block");
 	    body = block;
-	    
+	  }  
 	}
 
     return body;
@@ -86,24 +99,28 @@ struct SclrEvolution : public FunctionPass {
     LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
 
     SmallVector<GetElementPtrInst *, 10> accessInst;
+	SmallVector<Loop *, 10> loopVector;
     std::map<int, Instruction *> instOffsetMap;
-    const SCEV *firstInstSCEV, *curInstSCEV;
-    int offset;
+    const SCEV *firstInstSCEV, *curInstSCEV, *baseObj;
+	BasicBlock *bb;
+    int offset, flag;
 
 	/// Each function may contain multiple loops of such array accesses, hence iterating across
-	/// all of them.
-    for (Loop *loop : LI) {
+	/// all of them. We also backup the original LoopInfo to avoid any errors during the reordering.
+	
+	for(Loop *loop : LI)
+	  loopVector.push_back(loop);
+
+    for (Loop *loop : loopVector) {
 			
-	  int flag = 0;	
-	  const SCEV *baseObj = NULL;
-      BasicBlock *bb = getLoopBody(loop);
+	  flag = 0;	
+	  baseObj = NULL;
+      bb = getLoopBody(loop);
       bb->dump();
 	
 	  /// Make a list of all GEP instructions. This list is used to calculate the offset below.
       for (Instruction &i : *bb)
-        if (isa<GetElementPtrInst>(i)) {
-
-		  GetElementPtrInst *GEPInst = dyn_cast<GetElementPtrInst>(&i);
+        if (auto *GEPInst = dyn_cast<GetElementPtrInst>(&i)) {
 		  
 		  if(baseObj)
 			if(SE.getPointerBase(SE.getSCEV(GEPInst)) != baseObj) {
@@ -116,7 +133,7 @@ struct SclrEvolution : public FunctionPass {
 		}
 	
 	  if(flag)
-		continue;
+	    continue;
 
       firstInstSCEV = SE.getSCEV(accessInst[0]);
 
@@ -137,7 +154,8 @@ struct SclrEvolution : public FunctionPass {
 	
       for (Instruction &i : *bb)
         if (isa<GetElementPtrInst>(i))
-          errs() << *(SE.getSCEV(&i)) << "\n";
+          LLVM_DEBUG(errs() << *(SE.getSCEV(&i)) << "\n");
+
       bb->dump();
 
 	  accessInst.clear();
