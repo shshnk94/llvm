@@ -19,11 +19,20 @@
 using namespace llvm;
 
 class LoopFusionPass : public FunctionPass {
+	
+  private:
 
-  LLVMContext *Context;
-  Module *ModuleObj;
+    LLVMContext *Context;
+    Module *ModuleObj;
+	
+	// Associated passes
+	ScalarEvolution *SE;
+	LoopInfo *LI;
+	DominatorTree *DT;
+	DependenceInfo *DI;	
 
 public:
+
   static char ID;
 
   LoopFusionPass() : FunctionPass(ID) {
@@ -84,10 +93,10 @@ public:
   /// \param LI : LoopInfo object contaning information about these loops.
   ///
   /// \returns FusedLoop : Pointer to the final loop after fusion.
-  Loop *fuseLoops(Loop *FirstLoop, Loop *SecondLoop, LoopInfo &LI) {
+  Loop *fuseLoops(Loop *FirstLoop, Loop *SecondLoop) {
 
     IRBuilder<> Builder(*Context);
-    Loop *LoopForBlock, *FusedLoop = LI.AllocateLoop();
+    Loop *LoopForBlock, *FusedLoop = LI->AllocateLoop();
     SmallVector<BasicBlock *, 10> blockVector;
     BasicBlock *FirstLatch, *SecondHeader;
     PHINode *FirstIndVar = FirstLoop->getCanonicalInductionVariable(),
@@ -125,13 +134,13 @@ public:
     for (BasicBlock *Block : blockVector)
       if ((Block != FirstLatch) && (Block != SecondHeader)) {
 	
-		LoopForBlock = LI.getLoopFor(Block);
+		LoopForBlock = LI->getLoopFor(Block);
 		
 		// Add the basic block to the fused loop.
 		// Change the loop to which it is associated, to the fused loop.
 		// Remove the reference of the block from the old loop.
         FusedLoop->addBlockEntry(Block);
-        LI.changeLoopFor(Block, FusedLoop);
+        LI->changeLoopFor(Block, FusedLoop);
 		LoopForBlock->removeBlockFromLoop(Block);
       }
 	
@@ -142,12 +151,12 @@ public:
     SecondHeader->eraseFromParent();
 	
 	// Add the FusedLoop to LoopInfo object and remove the earlier unfused ones.
-    LI.addTopLevelLoop(FusedLoop);
+    LI->addTopLevelLoop(FusedLoop);
 
-    LI.removeLoop(llvm::find(LI, FirstLoop));
-    LI.destroy(FirstLoop);
-    LI.removeLoop(llvm::find(LI, SecondLoop));
-    LI.destroy(SecondLoop);
+    LI->removeLoop(llvm::find(*LI, FirstLoop));
+    LI->destroy(FirstLoop);
+    LI->removeLoop(llvm::find(*LI, SecondLoop));
+    LI->destroy(SecondLoop);
 
     return FusedLoop;
   }
@@ -203,7 +212,8 @@ public:
     if ((FirstLoopExit->size() < 3) &&
         (FirstLoopExit->getUniqueSuccessor() == SecondLoopHeader))
       return true;
-
+	
+	errs() << "Loops are not continuous\n";
     return false;
   }
 	
@@ -213,15 +223,15 @@ public:
   /// \param SecondLoop : Second loop in the set which will be fused with FirstLoop
   ///
   /// \returns true if they have the same bounds, false if not.
-  bool haveSameBounds(ScalarEvolution &SE, Loop *FirstLoop, Loop *SecondLoop) {
+  bool haveSameBounds(Loop *FirstLoop, Loop *SecondLoop) {
 
-    int firstIndVarBase, secondIndVarBase, difference;
+    int firstIndVarBase, secondIndVarBase;
     const SCEV *FirstUpBoundSCEV, *SecondUpBoundSCEV;
     Instruction &FirstBranchCmp = *(++(FirstLoop->getHeader()->begin())),
                 &SecondBranchCmp = *(++(SecondLoop->getHeader()->begin()));
     PHINode *FirstIndVar = FirstLoop->getCanonicalInductionVariable(),
             *SecondIndVar = SecondLoop->getCanonicalInductionVariable();
-	
+		
 	// Get the base case for both IVs and check if they are equal.
     firstIndVarBase =
         dyn_cast<ConstantInt>(FirstIndVar->getIncomingValueForBlock(
@@ -232,21 +242,29 @@ public:
                                   SecondLoop->getLoopPreheader()))
             ->getSExtValue();
 
-    if (firstIndVarBase != secondIndVarBase)
+    if (firstIndVarBase != secondIndVarBase){
+
+	  errs() << "Loop lower bound is different\n";
       return false;
+	}
 	
 	// If the base cases are equal, check if they have the same upper bounds.
 	// We need not check for step size as it'll increment by 1 in canonical form obtained after -loop-simplify
-    FirstUpBoundSCEV = SE.getSCEV(FirstBranchCmp.getOperand(1));
-    SecondUpBoundSCEV = SE.getSCEV(SecondBranchCmp.getOperand(1));
+	if(FirstBranchCmp.getOperand(0) != FirstIndVar)
+	  FirstUpBoundSCEV = SE->getSCEV(FirstBranchCmp.getOperand(0));
+	else
+	  FirstUpBoundSCEV = SE->getSCEV(FirstBranchCmp.getOperand(1));
 
-    difference = dyn_cast<SCEVConstant>(
-                     SE.getMinusSCEV(FirstUpBoundSCEV, SecondUpBoundSCEV))
-                     ->getAPInt()
-                     .getSExtValue();
+	if(SecondBranchCmp.getOperand(0) != SecondIndVar)
+	  SecondUpBoundSCEV = SE->getSCEV(SecondBranchCmp.getOperand(0));
+	else
+	  SecondUpBoundSCEV = SE->getSCEV(SecondBranchCmp.getOperand(1));
 
-    if (difference != 0)
+    if (FirstUpBoundSCEV != SecondUpBoundSCEV){
+
+	  errs() << "Loop upper bound is different\n";
       return false;
+	}
 
     return true;
   }
@@ -259,12 +277,16 @@ public:
   ///
   /// \returns true if any dependencies, false if not.
   bool checkDependencies(BasicBlock *FirstBody,
-                         BasicBlock *SecondBody, DependenceInfo &DI) {
+                         BasicBlock *SecondBody) {
 
     for (Instruction &Src : *SecondBody)
-      for (Instruction &Dest : *FirstBody)
-        if (auto Dep = DI.depends(&Src, &Dest, true))
-          return true;
+
+	  if (isa<LoadInst>(Src) || isa<StoreInst>(Src))
+        for (Instruction &Dest : *FirstBody)
+
+		  if(isa<LoadInst>(Dest) || isa<StoreInst>(Dest))
+        	if (auto Dep = DI->depends(&Src, &Dest, true))
+          	  return true;
 
     return false;
   }
@@ -282,9 +304,7 @@ public:
   /// \param DI : DependenceInfo object
   ///
   /// \returns void
-  void fuseIfNoDependencies(Loop *FirstLoop, Loop *SecondLoop, LoopInfo &LI,
-                            DominatorTree &DT, Function &F,
-                            DependenceInfo &DI) {
+  void fuseIfNoDependencies(Loop *FirstLoop, Loop *SecondLoop, Function &F) {
 
     IRBuilder<> Builder(*Context);
     ValueToValueMapTy VMap;
@@ -299,8 +319,8 @@ public:
 	// instruction are same as in the original loops which needs to be remapped later. 
     Loop *ClonedFirstLoop =
              cloneLoopWithPreheader(FirstPreHeader, FirstPreHeader, FirstLoop,
-                                    VMap, ".clone", &LI, &DT, ClonedLoopBlocks);
-    cloneLoopWithPreheader(FirstPreHeader, SecondPreHeader, SecondLoop, VMap, ".clone", &LI, &DT, ClonedLoopBlocks);
+                                    VMap, ".clone", LI, DT, ClonedLoopBlocks);
+    cloneLoopWithPreheader(FirstPreHeader, SecondPreHeader, SecondLoop, VMap, ".clone", LI, DT, ClonedLoopBlocks);
 
     remapInstructionsInBlocks(ClonedLoopBlocks, VMap);
 
@@ -312,10 +332,10 @@ public:
 
     FirstBody = getLoopBody(FirstLoop);
     SecondBody = getLoopBody(SecondLoop);
-    FusedLoop = fuseLoops(FirstLoop, SecondLoop, LI);
+    FusedLoop = fuseLoops(FirstLoop, SecondLoop);
 
 	// If there are no dependencies, the parent block branches to the fused loop.
-    if (checkDependencies(FirstBody, SecondBody, DI))
+    if (checkDependencies(FirstBody, SecondBody))
       Branch->setSuccessor(0, ClonedFirstLoop->getLoopPreheader());
 
     return;
@@ -323,22 +343,23 @@ public:
 
   bool runOnFunction(Function &F) override {
 
-    ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
-    LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
-    DominatorTree &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
-    DependenceInfo &DI = getAnalysis<DependenceAnalysisWrapperPass>().getDI();
+    SE = &getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+    LI = &getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+    DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
+    DI = &getAnalysis<DependenceAnalysisWrapperPass>().getDI();
 
     Context = &F.getContext();
     ModuleObj = F.getParent();
 
     SmallVector<Loop *, 10> loopVector;
 
-    for (Loop *CurLoop : LI)
+    for (Loop *CurLoop : *LI)
       loopVector.push_back(CurLoop);
-
+	
+	haveSameBounds(loopVector[1], loopVector[0]);
     if (areStructuredAndContinuous(loopVector[1], loopVector[0]) &&
-        haveSameBounds(SE, loopVector[1], loopVector[0]))
-      fuseIfNoDependencies(loopVector[1], loopVector[0], LI, DT, F, DI);
+        haveSameBounds(loopVector[1], loopVector[0]))
+      fuseIfNoDependencies(loopVector[1], loopVector[0], F);
 	
     return false;
   }
