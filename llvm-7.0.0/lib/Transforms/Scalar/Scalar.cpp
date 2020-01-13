@@ -104,6 +104,7 @@ void llvm::initializeScalarOpts(PassRegistry &Registry) {
   initializeLoopVersioningPassPass(Registry);
   initializeEntryExitInstrumenterPass(Registry);
   initializePostInlineEntryExitInstrumenterPass(Registry);
+  initializeLoopFusionPassPass(Registry);
 }
 
 void LLVMAddLoopSimplifyCFGPass(LLVMPassManagerRef PM) {
